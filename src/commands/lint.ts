@@ -11,6 +11,9 @@ import { ensureTsgolintSource, validateVersion, cachedBinaryExists, getBinaryPat
 import { computeContentHash } from '../hash.ts'
 import { execAsync } from '../exec.ts'
 
+const BUILD_LOCK_RETRY_MS = 100
+const BUILD_LOCK_TIMEOUT_MS = 10 * 60_000
+
 async function checkGoInstalled(): Promise<void> {
   try {
     await execAsync('go', ['version'])
@@ -19,6 +22,40 @@ async function checkGoInstalled(): Promise<void> {
       'Go is required to build rules.\n' +
       'Install from https://go.dev/dl/',
     )
+  }
+}
+
+async function wait(ms: number): Promise<void> {
+  await new Promise((resolve) => {
+    setTimeout(resolve, ms)
+  })
+}
+
+function isErrorWithCode(error: unknown, code: string): boolean {
+  return error instanceof Error && (error as NodeJS.ErrnoException).code === code
+}
+
+async function acquireBuildLock(buildDir: string): Promise<string> {
+  const lockDir = `${buildDir}.lock`
+  fs.mkdirSync(path.dirname(lockDir), { recursive: true })
+
+  const startedAt = Date.now()
+  while (true) {
+    try {
+      fs.mkdirSync(lockDir)
+      return lockDir
+    } catch (error) {
+      if (!isErrorWithCode(error, 'EEXIST')) {
+        throw error
+      }
+      if (Date.now() - startedAt > BUILD_LOCK_TIMEOUT_MS) {
+        throw new Error(
+          `Timed out waiting for build lock: ${lockDir}. ` +
+          'If no lintcn process is running, delete this directory and retry.',
+        )
+      }
+      await wait(BUILD_LOCK_RETRY_MS)
+    }
   }
 }
 
@@ -56,44 +93,54 @@ export async function buildBinary({
     return getBinaryPath(contentHash)
   }
 
-  // ensure .lintcn/go.mod exists (gitignored, needed by the build workspace symlink)
-  generateEditorGoFiles(lintcnDir)
-
-  // generate build workspace (per-hash dir to avoid races between concurrent processes)
   const buildDir = getBuildDir(contentHash)
-  console.log('Generating build workspace...')
-  generateBuildWorkspace({
-    buildDir,
-    tsgolintDir,
-    lintcnDir,
-    rules,
-  })
+  const buildLockDir = await acquireBuildLock(buildDir)
+  try {
+    if (!rebuild && cachedBinaryExists(contentHash)) {
+      console.log('Using cached binary')
+      return getBinaryPath(contentHash)
+    }
 
-  // compile
-  const binDir = getBinDir()
-  fs.mkdirSync(binDir, { recursive: true })
-  const binaryPath = getBinaryPath(contentHash)
+    // ensure .lintcn/go.mod exists (gitignored, needed by the build workspace symlink)
+    generateEditorGoFiles(lintcnDir)
 
-  // Check if any lintcn binary has been built before — if not, this is a cold
-  // build that compiles the full tsgolint + typescript-go dependency tree.
-  const existingBins = fs.existsSync(binDir) ? fs.readdirSync(binDir) : []
-  if (existingBins.length === 0) {
-    console.log('Compiling custom tsgolint binary (first build — may take 30s+ to compile dependencies)...')
-    console.log('Subsequent builds will be fast (~1s). In CI, cache ~/.cache/lintcn/ and GOCACHE (run `go env GOCACHE`).')
-  } else {
-    console.log('Compiling custom tsgolint binary...')
+    // generate build workspace (per-hash dir to avoid races between concurrent processes)
+    console.log('Generating build workspace...')
+    generateBuildWorkspace({
+      buildDir,
+      tsgolintDir,
+      lintcnDir,
+      rules,
+    })
+
+    // compile
+    const binDir = getBinDir()
+    fs.mkdirSync(binDir, { recursive: true })
+    const binaryPath = getBinaryPath(contentHash)
+
+    // Check if any lintcn binary has been built before — if not, this is a cold
+    // build that compiles the full tsgolint + typescript-go dependency tree.
+    const existingBins = fs.existsSync(binDir) ? fs.readdirSync(binDir) : []
+    if (existingBins.length === 0) {
+      console.log('Compiling custom tsgolint binary (first build — may take 30s+ to compile dependencies)...')
+      console.log('Subsequent builds will be fast (~1s). In CI, cache ~/.cache/lintcn/ and GOCACHE (run `go env GOCACHE`).')
+    } else {
+      console.log('Compiling custom tsgolint binary...')
+    }
+
+    const { exitCode: buildExitCode } = await execAsync('go', ['build', '-trimpath', '-o', binaryPath, './wrapper'], {
+      cwd: buildDir,
+      stdio: 'inherit',
+    })
+    if (buildExitCode !== 0) {
+      throw new Error(`Go compilation failed (exit code ${buildExitCode})`)
+    }
+
+    console.log('Build complete')
+    return binaryPath
+  } finally {
+    fs.rmSync(buildLockDir, { recursive: true, force: true })
   }
-
-  const { exitCode: buildExitCode } = await execAsync('go', ['build', '-trimpath', '-o', binaryPath, './wrapper'], {
-    cwd: buildDir,
-    stdio: 'inherit',
-  })
-  if (buildExitCode !== 0) {
-    throw new Error(`Go compilation failed (exit code ${buildExitCode})`)
-  }
-
-  console.log('Build complete')
-  return binaryPath
 }
 
 export async function lint({
